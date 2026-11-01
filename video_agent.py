@@ -173,14 +173,32 @@ def cmd_reframe(args):
     if args.to not in REFRAME_TARGETS:
         raise VideoAgentError(f"bad --to (choose from {list(REFRAME_TARGETS)})")
     tw, th = REFRAME_TARGETS[args.to]
-    vf = (f"scale={tw}:{th}:force_original_aspect_ratio=increase,"
-          f"crop={tw}:{th},format=yuv420p")
-    print(f"reframing to {args.to} ({tw}x{th}) ...")
-    cmd = [FFMPEG, "-y", "-i", src, "-vf", vf,
-           "-c:v", "libx264", "-preset", "medium", "-crf", "20",
-           "-c:a", "aac", "-b:a", "128k",
-           "-movflags", "+faststart", out]
-    run(cmd, check_desc="reframe")
+    bg = getattr(args, "bg", "crop")
+    if bg not in ("crop", "blur"):
+        raise VideoAgentError("--bg must be crop|blur")
+    if bg == "crop":
+        print(f"reframing to {args.to} ({tw}x{th}, center crop) ...")
+        vf = (f"scale={tw}:{th}:force_original_aspect_ratio=increase,"
+              f"crop={tw}:{th},format=yuv420p")
+        cmd = [FFMPEG, "-y", "-i", src, "-vf", vf,
+               "-c:v", "libx264", "-preset", "medium", "-crf", "20",
+               "-c:a", "aac", "-b:a", "128k",
+               "-movflags", "+faststart", out]
+        run(cmd, check_desc="reframe")
+    else:
+        print(f"reframing to {args.to} ({tw}x{th}, blurred background) ...")
+        fg_scale = f"scale={tw}:-2" if tw <= th else f"scale=-2:{th}"
+        fc = (f"[0:v]split[a][b];"
+              f"[a]scale={tw}:{th}:force_original_aspect_ratio=increase,"
+              f"crop={tw}:{th},gblur=sigma=40,eq=brightness=-0.15[bg];"
+              f"[b]{fg_scale}[fg];"
+              f"[bg][fg]overlay=(W-w)/2:(H-h)/2,format=yuv420p[v]")
+        cmd = [FFMPEG, "-y", "-i", src, "-filter_complex", fc,
+               "-map", "[v]", "-map", "0:a?",
+               "-c:v", "libx264", "-preset", "medium", "-crf", "20",
+               "-c:a", "aac", "-b:a", "128k",
+               "-movflags", "+faststart", out]
+        run(cmd, check_desc="reframe")
     print(f"wrote {out}")
 
 
@@ -254,20 +272,101 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
         f.write("\n".join(lines) + "\n")
 
 
+def write_karaoke_ass(words, ass_path, width, height):
+    """Word-by-word highlight captions using ASS karaoke timing.
+
+    words: list of {"word", "start", "end"} dicts.
+    Groups words into cues (max 6 words or 2.8s); each cue is ONE Dialogue
+    line with a {\\k<centiseconds>} tag per word. libass flips each word from
+    the style's SecondaryColour (white, waiting) to PrimaryColour (yellow,
+    sung) as its time arrives — the classic viral-caption look.
+    Returns the number of words written.
+    """
+    size = max(40, int(64 * width / 1080))
+    marginv = int(height * 0.09)
+    header = f"""[Script Info]
+ScriptType: v4.00+
+PlayResX: {width}
+PlayResY: {height}
+ScaledBorderAndShadow: yes
+WrapStyle: 0
+
+[V4+ Styles]
+Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding
+Style: Karaoke,DejaVu Sans,{size},&H0000FFFF,&H00FFFFFF,&H80000000,&H80000000,-1,0,0,0,100,100,0,0,1,3,0,2,24,24,{marginv},1
+
+[Events]
+Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
+"""
+
+    def esc(t):
+        return t.replace("\\", "\\\\").replace("{", "\\{").replace("}", "\\}")
+
+    clean = [w for w in words
+             if str(w.get("word", "")).strip()
+             and float(w.get("end", 0)) > float(w.get("start", 0))]
+    cues, cur = [], []
+    for w in clean:
+        cur.append(w)
+        span = float(cur[-1]["end"]) - float(cur[0]["start"])
+        if len(cur) >= 6 or span >= 2.8:
+            cues.append(cur)
+            cur = []
+    if cur:
+        cues.append(cur)
+    lines = [header]
+    for cue in cues:
+        c0, c1 = float(cue[0]["start"]), float(cue[-1]["end"])
+        parts = []
+        for w in cue:
+            cs = max(1, int(round((float(w["end"]) - float(w["start"])) * 100)))
+            parts.append(f"{{\\k{cs}}}{esc(str(w['word']).strip())}")
+        text = " ".join(parts)
+        lines.append(f"Dialogue: 0,{ass_ts(c0)},{ass_ts(c1)},Karaoke,,0,0,0,,{text}")
+    with open(ass_path, "w", encoding="utf-8") as f:
+        f.write("\n".join(lines) + "\n")
+    return len(clean)
+
+
 def cmd_caption(args):
-    src = require_input(args.input)
-    srt = require_input(args.srt)
-    out = prepare_output(args.output, args.force)
-    cues = parse_srt(srt)
+    # Karaoke can be called with 2 positionals (srt omitted):
+    #   caption INPUT OUTPUT --style karaoke --words w.words.json
+    srt, src_arg, out_arg = args.srt, args.input, args.output
+    if args.style == "karaoke" and out_arg is None and args.words:
+        srt, src_arg, out_arg = None, srt, src_arg
+    src = require_input(src_arg)
+    if not out_arg:
+        raise VideoAgentError("caption needs input and output paths")
+    out = prepare_output(out_arg, args.force)
+    style = args.style
+    if style == "karaoke":
+        if not args.words:
+            raise VideoAgentError(
+                "karaoke style needs --words <words.json> "
+                "(run: transcribe --word-timestamps)")
+        with open(require_input(args.words), encoding="utf-8") as f:
+            words = json.load(f)
+
+        def make_ass(ass_path, w, h):
+            n = write_karaoke_ass(words, ass_path, w, h)
+            print(f"burning karaoke captions ({n} words) ...")
+    else:
+        if not args.srt:
+            raise VideoAgentError(
+                "caption needs an .srt file (or use --style karaoke --words)")
+        cues = parse_srt(require_input(args.srt))
+
+        def make_ass(ass_path, w, h):
+            write_ass(cues, ass_path, w, h, style)
+            print(f"burning {len(cues)} cues ({style} style) ...")
     info = ffprobe_json(src)
     v = video_stream(info)
     if not v:
         raise VideoAgentError("input has no video stream")
     w, h = int(v["width"]), int(v["height"])
-    print(f"burning {len(cues)} cues ({args.style} style) ...")
     with tempfile.TemporaryDirectory(prefix="va_cap_") as td:
         ass = os.path.join(td, "subs.ass")
-        write_ass(cues, ass, w, h, args.style)
+        make_ass(ass, w, h)
         # libass needs the path escaped for the filter parser
         ass_esc = ass.replace(":", "\\:").replace("'", "\\'").replace(",", "\\,")
         cmd = [FFMPEG, "-y", "-i", src, "-vf", f"ass='{ass_esc}'",
@@ -344,6 +443,15 @@ def cmd_transcribe(args):
             text = " ".join(w.word.strip() for w in cue)
             f.write(f"{i}\n{srt_ts(cue[0].start)} --> {srt_ts(cue[-1].end)}\n{text}\n\n")
     print(f"wrote {out} ({len(cues)} cues)")
+    if getattr(args, "word_timestamps", False):
+        wj = os.path.splitext(out)[0] + ".words.json"
+        wdata = [{"word": w.word.strip(),
+                  "start": round(float(w.start), 3),
+                  "end": round(float(w.end), 3)}
+                 for w in words if w.word.strip()]
+        with open(wj, "w", encoding="utf-8") as f:
+            json.dump(wdata, f, ensure_ascii=False)
+        print(f"wrote {wj} ({len(wdata)} words)")
     if not cues:
         print("note: no speech detected in this clip")
 
@@ -374,6 +482,22 @@ def detect_silences(path, threshold_db, min_dur):
     return silences, dur
 
 
+def _keep_segments(src, out, keeps, desc):
+    """Keep only keeps=[(start,end)...] of src (complement was cut).
+
+    Re-encodes with select/aselect so A/V stay in sync."""
+    if not keeps:
+        raise VideoAgentError(f"{desc}: nothing left to keep")
+    sel = "+".join(f"between(t,{s:.3f},{e:.3f})" for s, e in keeps)
+    cmd = [FFMPEG, "-y", "-i", src,
+           "-vf", f"select='{sel}',setpts=N/FRAME_RATE/TB",
+           "-af", f"aselect='{sel}',asetpts=N/SR/TB",
+           "-c:v", "libx264", "-preset", "medium", "-crf", "20",
+           "-c:a", "aac", "-b:a", "128k",
+           "-movflags", "+faststart", out]
+    run(cmd, check_desc=desc)
+
+
 def cmd_cut_silence(args):
     src = require_input(args.input)
     out = prepare_output(args.output, args.force)
@@ -392,18 +516,89 @@ def cmd_cut_silence(args):
         cursor = max(cursor, e)
     if cursor < dur:
         keeps.append((cursor, dur))
-    if not keeps:
-        raise VideoAgentError("whole clip is silence — nothing to keep")
     total_kept = sum(e - s for s, e in keeps)
-    sel = "+".join(f"between(t,{s:.3f},{e:.3f})" for s, e in keeps)
     print(f"cutting {len(silences)} silent spans, keeping {total_kept:.1f}s of {dur:.1f}s ...")
-    cmd = [FFMPEG, "-y", "-i", src,
-           "-vf", f"select='{sel}',setpts=N/FRAME_RATE/TB",
-           "-af", f"aselect='{sel}',asetpts=N/SR/TB",
-           "-c:v", "libx264", "-preset", "medium", "-crf", "20",
-           "-c:a", "aac", "-b:a", "128k",
-           "-movflags", "+faststart", out]
-    run(cmd, check_desc="cut-silence")
+    _keep_segments(src, out, keeps, "cut-silence")
+    print(f"wrote {out}")
+
+
+# --------------------------------------------------------------------------
+# defiller — cut filler words (um/uh/...) using word-level timings
+# --------------------------------------------------------------------------
+
+DEFAULT_FILLERS = "um,uh,ah,er,erm,hmm,uhm"
+
+PUNCT_STRIP = ".,!?;:'\"()[]\u2026\u2014-"
+
+
+def load_words_json(path):
+    with open(require_input(path), encoding="utf-8") as f:
+        data = json.load(f)
+    words = []
+    for w in data:
+        try:
+            words.append({"word": str(w["word"]),
+                          "start": float(w["start"]),
+                          "end": float(w["end"])})
+        except (KeyError, ValueError, TypeError):
+            continue
+    return [w for w in words if w["word"].strip() and w["end"] > w["start"]]
+
+
+def cmd_defiller(args):
+    src = require_input(args.input)
+    out = prepare_output(args.output, args.force)
+    fillers = {f.strip().lower() for f in args.fillers.split(",") if f.strip()}
+    if not fillers:
+        raise VideoAgentError("--fillers is empty")
+    if args.words:
+        words = load_words_json(args.words)
+    else:
+        print("no --words given, transcribing first (tiny model) ...")
+        with tempfile.TemporaryDirectory(prefix="va_defill_") as td:
+            srt = os.path.join(td, "w.srt")
+            ns = argparse.Namespace(input=src, output=srt, model="tiny",
+                                    lang="en", force=True, word_timestamps=True)
+            try:
+                cmd_transcribe(ns)
+            except VideoAgentError as e:
+                raise VideoAgentError(f"defiller needs transcription: {e}")
+            words = load_words_json(os.path.splitext(srt)[0] + ".words.json")
+    if not words:
+        print("no words found — copying input unchanged")
+        shutil.copyfile(src, out)
+        return
+    dur = duration_of(src)
+    cuts = []
+    for w in words:
+        txt = w["word"].strip().lower().strip(PUNCT_STRIP)
+        if txt in fillers:
+            s = max(0.0, w["start"] - 0.08)
+            e = min(dur, w["end"] + 0.15)
+            if e > s:
+                cuts.append((s, e))
+    cuts.sort()
+    merged = []
+    for s, e in cuts:
+        if merged and s <= merged[-1][1] + 0.05:
+            merged[-1] = (merged[-1][0], max(merged[-1][1], e))
+        else:
+            merged.append((s, e))
+    if not merged:
+        print("no filler words found — copying input unchanged")
+        shutil.copyfile(src, out)
+        return
+    keeps = []
+    cursor = 0.0
+    for s, e in merged:
+        if s > cursor:
+            keeps.append((cursor, s))
+        cursor = max(cursor, e)
+    if cursor < dur:
+        keeps.append((cursor, dur))
+    total_cut = sum(e - s for s, e in merged)
+    print(f"cutting {len(merged)} filler spans ({total_cut:.1f}s) ...")
+    _keep_segments(src, out, keeps, "defiller")
     print(f"wrote {out}")
 
 
@@ -551,7 +746,86 @@ def cmd_compress(args):
 
 
 # --------------------------------------------------------------------------
-# reel: reframe -> transcribe -> captions -> compress
+# progressbar — thin progress bar along the bottom
+# --------------------------------------------------------------------------
+
+PROGRESS_COLORS = {"gold": "0xB07D28", "white": "white", "red": "red",
+                   "yellow": "yellow"}
+
+
+def parse_bar_color(c):
+    c = c.strip()
+    if c.startswith("#"):
+        return "0x" + c[1:]
+    return PROGRESS_COLORS.get(c.lower(), c)
+
+
+def cmd_progressbar(args):
+    src = require_input(args.input)
+    out = prepare_output(args.output, args.force)
+    info = ffprobe_json(src)
+    v = video_stream(info)
+    if not v:
+        raise VideoAgentError("input has no video stream")
+    w, h = int(v["width"]), int(v["height"])
+    try:
+        dur = float(info["format"]["duration"])
+    except (KeyError, ValueError, TypeError):
+        raise VideoAgentError(f"could not determine duration of {src}")
+    if dur <= 0:
+        raise VideoAgentError("zero-duration input")
+    col = parse_bar_color(args.color)
+    bh = args.height
+    # NOTE: this ffmpeg's drawbox does not accept W/H constants in
+    # expressions, so bake the probed dimensions in as plain numbers.
+    # `t` (frame timestamp) does work.
+    bx, bw, by = 20, w - 40, h - 30
+    vf = (f"drawbox=x={bx}:y={by}:w={bw}:h={bh}:color=black@0.35:t=fill,"
+          f"drawbox=x={bx}:y={by}:w='min({bw},{bw}*t/{dur:.3f})':h={bh}:"
+          f"color={col}:t=fill")
+    print(f"adding progress bar ({args.color}) ...")
+    cmd = [FFMPEG, "-y", "-i", src, "-vf", vf,
+           "-c:v", "libx264", "-preset", "medium", "-crf", "20",
+           "-c:a", "copy", "-movflags", "+faststart", out]
+    run(cmd, check_desc="progressbar")
+    print(f"wrote {out}")
+
+
+# --------------------------------------------------------------------------
+# mix — background music ducked under the voice
+# --------------------------------------------------------------------------
+
+def cmd_mix(args):
+    src = require_input(args.input)
+    mus = require_input(args.music)
+    out = prepare_output(args.output, args.force)
+    info = ffprobe_json(src)
+    if audio_stream(info) is None:
+        raise VideoAgentError("input video has no audio track to duck against")
+    dur = duration_of(src)
+    ratio = min(20.0, max(1.5, 1.0 / max(args.duck, 0.05)))
+    fc = (
+        f"[1:a]volume={args.music_db}dB,aresample=44100,"
+        f"aloop=loop=-1:size=2000000000,atrim=0:{dur:.3f},"
+        f"asetpts=PTS-STARTPTS,aformat=channel_layouts=stereo[mus];"
+        f"[0:a]aresample=44100,aformat=channel_layouts=stereo,asplit[v1][v2];"
+        f"[v1]acompressor=threshold=-22dB:ratio=3:attack=200:release=800[ctl];"
+        f"[mus][ctl]sidechaincompress=threshold=0.08:ratio={ratio:.1f}:"
+        f"attack=200:release=1000[musd];"
+        f"[v2][musd]amix=inputs=2:duration=first:dropout_transition=0[aout]"
+    )
+    print(f"mixing music (ducked to ~{args.duck:.0%} under voice, {args.music_db}dB) ...")
+    cmd = [FFMPEG, "-y", "-i", src, "-stream_loop", "-1", "-i", mus,
+           "-filter_complex", fc,
+           "-map", "0:v:0", "-map", "[aout]",
+           "-c:v", "copy", "-c:a", "aac", "-b:a", "192k",
+           "-movflags", "+faststart", out]
+    run(cmd, check_desc="mix")
+    print(f"wrote {out}")
+
+
+# --------------------------------------------------------------------------
+# reel: defiller -> reframe -> transcribe -> captions -> progress -> music -> compress
 # --------------------------------------------------------------------------
 
 def cmd_reel(args):
@@ -559,35 +833,77 @@ def cmd_reel(args):
     out = prepare_output(args.output, args.force)
     if args.captions not in ("on", "off"):
         raise VideoAgentError("--captions must be on|off")
+    karaoke = args.karaoke
+    step = 0
+
+    def nxt(label):
+        nonlocal step
+        step += 1
+        print(f"[{step}] {label} ...")
+
     with tempfile.TemporaryDirectory(prefix="va_reel_") as td:
-        stage1 = os.path.join(td, "reframed.mp4")
-        print("[1/4] reframing to 9:16 ...")
-        ns = argparse.Namespace(input=src, output=stage1, to="9:16", force=True)
-        cmd_reframe(ns)
+        def stage(name):
+            return os.path.join(td, name + ".mp4")
+
+        cur = src
+        if args.defiller:
+            nxt("removing filler words")
+            d1 = stage("defilled")
+            cmd_defiller(argparse.Namespace(
+                input=cur, output=d1, words=None,
+                fillers=DEFAULT_FILLERS, force=True))
+            cur = d1
+
+        nxt("reframing to 9:16" + (" (blurred background)" if args.bg_blur else ""))
+        r1 = stage("reframed")
+        cmd_reframe(argparse.Namespace(
+            input=cur, output=r1, to="9:16",
+            bg="blur" if args.bg_blur else "crop", force=True))
+        cur = r1
 
         srt = os.path.join(td, "caps.srt")
-        captioned = os.path.join(td, "captioned.mp4")
-        if args.captions == "on":
-            print("[2/4] transcribing ...")
+        if karaoke or args.captions == "on":
+            nxt("transcribing" + (" (word timestamps)" if karaoke else ""))
             try:
-                nt = argparse.Namespace(input=stage1, output=srt, model="tiny",
-                                        lang="en", force=True)
-                cmd_transcribe(nt)
-                print("[3/4] burning captions ...")
-                nc = argparse.Namespace(input=stage1, output=captioned,
-                                        srt=srt, style="reel", force=True)
-                cmd_caption(nc)
+                cmd_transcribe(argparse.Namespace(
+                    input=cur, output=srt, model="tiny", lang="en",
+                    force=True, word_timestamps=karaoke))
+                c1 = stage("captioned")
+                if karaoke:
+                    nxt("burning karaoke captions")
+                    cmd_caption(argparse.Namespace(
+                        input=cur, output=c1, srt=None, style="karaoke",
+                        words=os.path.splitext(srt)[0] + ".words.json",
+                        force=True))
+                else:
+                    nxt("burning captions")
+                    cmd_caption(argparse.Namespace(
+                        input=cur, output=c1, srt=srt, style="reel",
+                        words=None, force=True))
+                cur = c1
             except VideoAgentError as e:
                 print(f"WARNING: captions skipped ({e}); continuing without them")
-                captioned = stage1
         else:
-            print("[2/4] captions off — skipping")
-            print("[3/4] captions off — skipping")
-            captioned = stage1
+            print("(captions off — skipping transcribe + burn)")
 
-        print("[4/4] compressing to <=90MB ...")
-        nk = argparse.Namespace(input=captioned, output=out, max_mb=90, force=True)
-        cmd_compress(nk)
+        if args.progress:
+            nxt("adding progress bar")
+            p1 = stage("progress")
+            cmd_progressbar(argparse.Namespace(
+                input=cur, output=p1, color="gold", height=6, force=True))
+            cur = p1
+
+        if args.music:
+            nxt("mixing background music")
+            m1 = stage("mixed")
+            cmd_mix(argparse.Namespace(
+                input=cur, music=args.music, output=m1,
+                duck=0.25, music_db=-18, force=True))
+            cur = m1
+
+        nxt("compressing to <=90MB")
+        cmd_compress(argparse.Namespace(
+            input=cur, output=out, max_mb=90, force=True))
     print(f"DONE -> {out}")
 
 
@@ -613,17 +929,30 @@ def main(argv=None):
     p = sub.add_parser("reframe", help="crop+scale to an aspect ratio")
     p.add_argument("input"); p.add_argument("output")
     p.add_argument("--to", default="9:16", help="9:16|1:1|16:9 (default 9:16)")
+    p.add_argument("--bg", default="crop",
+                   help="crop = center crop (default) | blur = blurred-background "
+                        "reframe, keeps full frame")
     add_common(p); p.set_defaults(func=cmd_reframe)
 
     p = sub.add_parser("caption", help="burn subtitles into video")
-    p.add_argument("srt"); p.add_argument("input"); p.add_argument("output")
-    p.add_argument("--style", default="reel", help="reel|simple")
+    p.add_argument("srt", nargs="?", default=None,
+                   help="subtitle file (omit for --style karaoke: "
+                        "caption INPUT OUTPUT --style karaoke --words w.json)")
+    p.add_argument("input", nargs="?", default=None)
+    p.add_argument("output", nargs="?", default=None)
+    p.add_argument("--style", default="reel", help="reel|simple|karaoke")
+    p.add_argument("--words", default=None,
+                   help="words.json from 'transcribe --word-timestamps' "
+                        "(required for karaoke)")
     add_common(p); p.set_defaults(func=cmd_caption)
 
     p = sub.add_parser("transcribe", help="speech -> SRT (needs faster-whisper)")
     p.add_argument("input")
     p.add_argument("--model", default="tiny", help="tiny|base")
     p.add_argument("--lang", default="en", help="language code (default en)")
+    p.add_argument("--word-timestamps", action="store_true",
+                   help="also write <output>.words.json with per-word timings "
+                        "(needed for karaoke captions and defiller)")
     p.add_argument("-o", "--output", default=None, help="output .srt path")
     add_common(p); p.set_defaults(func=cmd_transcribe)
 
@@ -632,6 +961,15 @@ def main(argv=None):
     p.add_argument("--threshold", type=float, default=-35, help="dB (default -35)")
     p.add_argument("--min", type=float, default=0.4, help="min silence seconds")
     add_common(p); p.set_defaults(func=cmd_cut_silence)
+
+    p = sub.add_parser("defiller", help="cut filler words (um/uh/...)")
+    p.add_argument("input"); p.add_argument("output")
+    p.add_argument("--words", default=None,
+                   help="words.json (from 'transcribe --word-timestamps'); "
+                        "if omitted, transcribes with the tiny model")
+    p.add_argument("--fillers", default=DEFAULT_FILLERS,
+                   help=f"comma-separated filler words (default: {DEFAULT_FILLERS})")
+    add_common(p); p.set_defaults(func=cmd_defiller)
 
     p = sub.add_parser("trim", help="cut a time range")
     p.add_argument("input"); p.add_argument("output")
@@ -662,9 +1000,34 @@ def main(argv=None):
     p.add_argument("--max-mb", type=float, default=90)
     add_common(p); p.set_defaults(func=cmd_compress)
 
+    p = sub.add_parser("progressbar", help="thin progress bar along the bottom")
+    p.add_argument("input"); p.add_argument("output")
+    p.add_argument("--color", default="gold",
+                   help="gold|white|red|yellow or #RRGGBB (default gold)")
+    p.add_argument("--height", type=int, default=6, help="bar height px")
+    add_common(p); p.set_defaults(func=cmd_progressbar)
+
+    p = sub.add_parser("mix", help="background music ducked under voice")
+    p.add_argument("input"); p.add_argument("music"); p.add_argument("output")
+    p.add_argument("--duck", type=float, default=0.25,
+                   help="music level kept while voice is active (default 0.25)")
+    p.add_argument("--music-db", type=float, default=-18,
+                   help="music base volume in dB (default -18)")
+    add_common(p); p.set_defaults(func=cmd_mix)
+
     p = sub.add_parser("reel", help="raw clip -> captioned 9:16 reel")
     p.add_argument("input"); p.add_argument("output")
     p.add_argument("--captions", default="on", help="on|off")
+    p.add_argument("--karaoke", action="store_true",
+                   help="word-by-word highlight captions (needs faster-whisper)")
+    p.add_argument("--defiller", action="store_true",
+                   help="cut filler words first (needs faster-whisper)")
+    p.add_argument("--bg-blur", action="store_true",
+                   help="blurred-background reframe instead of center crop")
+    p.add_argument("--progress", action="store_true",
+                   help="add gold progress bar")
+    p.add_argument("--music", default=None,
+                   help="background music file (auto-ducked under voice)")
     add_common(p); p.set_defaults(func=cmd_reel)
 
     args = ap.parse_args(argv)

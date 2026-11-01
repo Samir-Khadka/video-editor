@@ -169,6 +169,112 @@ class VideoAgentTest(unittest.TestCase):
         # 8s input with a 2s silent gap -> expect ~6s out
         self.assertTrue(5.0 < d < 7.0, f"duration {d}")
 
+    # -- karaoke ---------------------------------------------------------
+    def write_words(self, name, words):
+        p = os.path.join(OUT, name)
+        with open(p, "w") as f:
+            json.dump(words, f)
+        return p
+
+    def sample_words(self):
+        # 8 words over ~4.5s of the 5s clip
+        t = 0.2
+        ws = []
+        for w in ["hello", "this", "is", "a", "karaoke", "caption", "test", "clip"]:
+            ws.append({"word": w, "start": round(t, 3), "end": round(t + 0.35, 3)})
+            t += 0.5
+        return ws
+
+    def test_karaoke_ass_file(self):
+        ass = os.path.join(OUT, "k.ass")
+        if os.path.exists(ass):
+            os.remove(ass)
+        n = va.write_karaoke_ass(self.sample_words(), ass, 1080, 1920)
+        self.assertEqual(n, 8)
+        with open(ass) as f:
+            text = f.read()
+        self.assertIn("Style: Karaoke,", text)
+        self.assertIn("\\k", text)  # karaoke timing tags
+        # 8 words -> cues of 6 + 2 -> one dialogue per cue
+        self.assertEqual(text.count("Dialogue:"), 2)
+        # primary (sung) colour is yellow, secondary (waiting) is white
+        self.assertIn("&H0000FFFF,", text)
+        self.assertIn("&H00FFFFFF,", text)
+
+    def test_caption_karaoke(self):
+        wj = self.write_words("kwords.json", self.sample_words())
+        o = self.out("karaoke.mp4")
+        run_cli("caption", self.clip, o, "--style", "karaoke",
+                "--words", wj)
+        d = va.duration_of(o)
+        self.assertTrue(4.5 < d < 5.5, f"duration {d}")
+        self.assertEqual(ffprobe_dims(o), (1280, 720))
+
+    def test_caption_karaoke_needs_words(self):
+        o = self.out("karaoke_nowords.mp4")
+        rc = va.main(["caption", self.clip, o, "--style", "karaoke"])
+        self.assertEqual(rc, 1)
+
+    # -- defiller --------------------------------------------------------
+    def test_defiller(self):
+        words = [
+            {"word": "hello", "start": 0.2, "end": 0.5},
+            {"word": "um", "start": 0.6, "end": 0.9},
+            {"word": "world", "start": 1.0, "end": 1.4},
+            {"word": "uh,", "start": 2.0, "end": 2.3},
+            {"word": "again", "start": 2.4, "end": 2.8},
+        ]
+        wj = self.write_words("fillers.json", words)
+        o = self.out("defilled.mp4")
+        run_cli("defiller", self.clip, o, "--words", wj)
+        d = va.duration_of(o)
+        # cuts um [0.52,1.05] and uh [1.92,2.45] -> ~3.9s kept
+        self.assertTrue(3.0 < d < 4.8, f"duration {d}")
+
+    def test_defiller_no_fillers(self):
+        words = [
+            {"word": "hello", "start": 0.2, "end": 0.5},
+            {"word": "world", "start": 1.0, "end": 1.4},
+        ]
+        wj = self.write_words("nofillers.json", words)
+        o = self.out("defilled_copy.mp4")
+        run_cli("defiller", self.clip, o, "--words", wj)
+        d = va.duration_of(o)
+        self.assertTrue(abs(d - 5.0) < 0.4, f"duration {d}")
+
+    # -- reframe blur ----------------------------------------------------
+    def test_reframe_blur(self):
+        o = self.out("reframed_blur.mp4")
+        run_cli("reframe", self.clip, o, "--to", "9:16", "--bg", "blur")
+        self.assertEqual(ffprobe_dims(o), (1080, 1920))
+        d = va.duration_of(o)
+        self.assertTrue(4.5 < d < 5.5, f"duration {d}")
+
+    # -- progressbar -----------------------------------------------------
+    def test_progressbar(self):
+        o = self.out("progress.mp4")
+        run_cli("progressbar", self.clip, o, "--color", "gold")
+        d = va.duration_of(o)
+        self.assertTrue(4.5 < d < 5.5, f"duration {d}")
+        self.assertEqual(ffprobe_dims(o), (1280, 720))
+
+    # -- mix -------------------------------------------------------------
+    def test_mix(self):
+        mus_long = os.path.join(OUT, "music_long.mp3")
+        mus_short = os.path.join(OUT, "music_short.mp3")
+        sh("ffmpeg", "-y", "-f", "lavfi", "-i", "sine=frequency=660:duration=10",
+           "-c:a", "libmp3lame", mus_long)
+        sh("ffmpeg", "-y", "-f", "lavfi", "-i", "sine=frequency=880:duration=2",
+           "-c:a", "libmp3lame", mus_short)
+        for name, mus in (("mixed_long.mp4", mus_long),
+                          ("mixed_short.mp4", mus_short)):
+            o = self.out(name)
+            run_cli("mix", self.clip, mus, o)
+            d = va.duration_of(o)
+            self.assertTrue(4.5 < d < 5.5, f"duration {d} ({name})")
+            info = va.ffprobe_json(o)
+            self.assertIsNotNone(va.audio_stream(info), name)
+
     # -- overwrite protection --------------------------------------------
     def test_no_overwrite_without_force(self):
         o = self.out("protect.mp4")
